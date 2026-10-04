@@ -29,6 +29,16 @@ type Item struct {
 	// RoundingError is the reduced fraction value(result)-value(input);
 	// it is null for infinities and absent for rejected inputs.
 	RoundingError json.RawMessage `json:"rounding_error,omitempty"`
+	// IntervalCertificate is included only when requested by the batch.
+	IntervalCertificate *IntervalCertificate `json:"interval_certificate,omitempty"`
+}
+
+// IntervalCertificate serializes an exact half.Interval for audit use.
+type IntervalCertificate struct {
+	Lower          *string `json:"lower"`
+	Upper          *string `json:"upper"`
+	LowerInclusive bool    `json:"lower_inclusive"`
+	UpperInclusive bool    `json:"upper_inclusive"`
 }
 
 // Response is the batch result envelope.
@@ -40,6 +50,8 @@ type Response struct {
 // Request is the accepted JSON envelope: {"values": ["1", "2"]}.
 type Request struct {
 	Values []string `json:"values"`
+	// IncludeIntervalCertificate opts in to exact per-pattern intervals.
+	IncludeIntervalCertificate bool `json:"include_interval_certificate,omitempty"`
 }
 
 var (
@@ -51,8 +63,9 @@ var (
 
 // ConvertOne parses and rounds a single decimal string. A rejected
 // input is reported with ok=false and is not an error at the Go level:
-// batch processing keeps going.
-func ConvertOne(index int, input string) Item {
+// batch processing keeps going. When includeCertificate is false, the
+// output shape is unchanged from the original conversion response.
+func ConvertOne(index int, input string, includeCertificate bool) Item {
 	item := Item{Index: index, Input: input, OK: false}
 	neg, r, err := decimal.Parse(input)
 	if err != nil {
@@ -76,7 +89,26 @@ func ConvertOne(index int, input string) Item {
 		raw, _ := json.Marshal(frac)
 		item.RoundingError = raw
 	}
+	if includeCertificate {
+		item.IntervalCertificate = makeCertificate(half.Certificate(b))
+	}
 	return item
+}
+
+func makeCertificate(in half.Interval) *IntervalCertificate {
+	cert := &IntervalCertificate{
+		LowerInclusive: in.LowerInclusive,
+		UpperInclusive: in.UpperInclusive,
+	}
+	if in.Lower != nil {
+		frac := fmt.Sprintf("%d/%d", in.Lower.Num(), in.Lower.Denom())
+		cert.Lower = &frac
+	}
+	if in.Upper != nil {
+		frac := fmt.Sprintf("%d/%d", in.Upper.Num(), in.Upper.Denom())
+		cert.Upper = &frac
+	}
+	return cert
 }
 
 // Run validates the batch and converts every entry.
@@ -90,7 +122,7 @@ func Run(req Request) (Response, error) {
 	}
 	resp := Response{Count: n, Result: make([]Item, n)}
 	for i, v := range req.Values {
-		resp.Result[i] = ConvertOne(i, v)
+		resp.Result[i] = ConvertOne(i, v, req.IncludeIntervalCertificate)
 	}
 	return resp, nil
 }

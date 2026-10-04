@@ -34,6 +34,18 @@ type Bits struct {
 	Class Class
 }
 
+// Interval is an exact certificate of the signed input values that round
+// to a binary16 bit pattern under roundTiesToEven.
+//
+// A nil bound means that side is unbounded (-∞ or +∞). The inclusive
+// flags are meaningful only for the corresponding non-nil endpoint.
+type Interval struct {
+	Lower          *big.Rat
+	Upper          *big.Rat
+	LowerInclusive bool
+	UpperInclusive bool
+}
+
 // Pattern returns the 16-bit encoding, formatted as four hex digits
 // by callers.
 func (b Bits) Pattern() uint16 {
@@ -44,10 +56,10 @@ func (b Bits) Pattern() uint16 {
 func (b Bits) IsInf() bool { return b.Class == ClassInfinity }
 
 // powersOfTwo caches 2^e for the small range visited during binade
-// searches (-25..16).
+// searches and interval certificates (-27..16).
 var powersOfTwo = map[int]*big.Rat{}
 
-// p2 returns the exact rational 2^e. The range needed is -25..16.
+// p2 returns the exact rational 2^e. The range needed is -27..16.
 func p2(e int) *big.Rat {
 	if v, ok := powersOfTwo[e]; ok {
 		// Return a copy: callers never mutate cached rationals in
@@ -213,4 +225,108 @@ func Error(b Bits, original *big.Rat) *big.Rat {
 		return nil
 	}
 	return new(big.Rat).Sub(b.Value, original)
+}
+
+// Certificate returns the exact set of signed finite decimal rationals
+// that Convert rounds to b. The endpoint tie decisions follow
+// roundTiesToEven, so they are not always closed: a midpoint belongs to
+// the adjacent even candidate rather than both neighboring patterns.
+func Certificate(b Bits) Interval {
+	if b.IsInf() {
+		threshold := new(big.Rat).SetInt64(65520)
+		if b.Sign == 0 {
+			return Interval{Lower: threshold, LowerInclusive: true}
+		}
+		threshold.Neg(threshold)
+		return Interval{Upper: threshold, UpperInclusive: true}
+	}
+
+	v := new(big.Rat).Set(b.Value)
+
+	if b.Class == ClassZero {
+		endpoint := p2(-25) // |v|=2^-25 is the even tie with zero
+		if b.Sign == 1 {
+			endpoint.Neg(endpoint)
+			return Interval{Lower: endpoint, Upper: v,
+				LowerInclusive: true, UpperInclusive: true}
+		}
+		return Interval{Lower: v, Upper: endpoint,
+			LowerInclusive: true, UpperInclusive: true}
+	}
+
+	mag := new(big.Rat).Abs(v)
+
+	// halfGap returns half the distance to the neighboring candidate on
+	// the requested side. At a normal power of two the lower neighbor is
+	// in the previous binade, so its ULP can be smaller than the current
+	// binade's ULP.
+	halfGap := func(higher bool) *big.Rat {
+		if b.E == 0 {
+			return p2(-25)
+		}
+		if b.F == 0 && !higher {
+			if b.E == 1 {
+				// Lower neighbor is the largest subnormal, whose spacing
+				// is 2^-24; its half is 2^-25 (the 2047/2^25 tie).
+				return p2(-25)
+			}
+			if b.E > 1 {
+				return p2(int(b.E) - 27)
+			}
+		}
+		// The upper neighbor of the largest finite value is infinity,
+		// and the overflow tie is at 65520 (half-gap 16 = 2^4).
+		if b.E == 30 && b.F == 1023 && higher {
+			return p2(4)
+		}
+		return p2(int(b.E) - 26)
+	}
+
+	lower := new(big.Rat).Sub(mag, halfGap(false))
+	upper := new(big.Rat).Add(mag, halfGap(true))
+	inclusive := b.F&1 == 0
+
+	if b.Sign == 1 {
+		positiveLower := new(big.Rat).Set(lower)
+		lower.Neg(upper)
+		upper.Neg(positiveLower)
+	}
+	return Interval{Lower: lower, Upper: upper,
+		LowerInclusive: inclusive, UpperInclusive: inclusive}
+}
+
+// Contains reports whether a finite signed input with the supplied literal
+// sign belongs to the interval. The neg flag is required to distinguish
+// signed zero inputs, whose rationals compare equal.
+func (in Interval) Contains(neg bool, r *big.Rat) bool {
+	if r == nil {
+		return false
+	}
+	if r.Sign() == 0 {
+		return in.containsZero(neg)
+	}
+	if in.Lower != nil {
+		if c := r.Cmp(in.Lower); c < 0 || (c == 0 && !in.LowerInclusive) {
+			return false
+		}
+	}
+	if in.Upper != nil {
+		if c := r.Cmp(in.Upper); c > 0 || (c == 0 && !in.UpperInclusive) {
+			return false
+		}
+	}
+	return true
+}
+
+func (in Interval) containsZero(negativeLiteral bool) bool {
+	zero := new(big.Rat)
+	if in.Lower != nil && in.Lower.Cmp(zero) == 0 && in.Upper != nil && in.Upper.Sign() >= 0 {
+		return !negativeLiteral
+	}
+	if in.Upper != nil && in.Upper.Cmp(zero) == 0 && in.Lower != nil && in.Lower.Sign() <= 0 {
+		return negativeLiteral
+	}
+	// No non-zero pattern has 0 in its rounding interval because the
+	// zero/smallest-subnormal tie belongs to even zero.
+	return false
 }

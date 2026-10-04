@@ -582,6 +582,154 @@ func TestOracleRandomDecimals(t *testing.T) {
 	}
 }
 
+// TestIntervalCertificates uses the exact midpoint between adjacent
+// binary16 patterns as an independent boundary oracle and checks both
+// endpoint ownership and points immediately on each side.
+func TestIntervalCertificates(t *testing.T) {
+	average := func(a, b *big.Rat) *big.Rat {
+		return new(big.Rat).Quo(new(big.Rat).Add(a, b), big.NewRat(2, 1))
+	}
+	between := func(a, b *big.Rat) *big.Rat {
+		return average(a, b)
+	}
+	signed := func(negative bool, v *big.Rat) *big.Rat {
+		if negative {
+			return new(big.Rat).Neg(v)
+		}
+		return new(big.Rat).Set(v)
+	}
+	shift := func(q, delta *big.Rat) *big.Rat { return new(big.Rat).Add(q, delta) }
+	wantMembership := func(t *testing.T, negative bool, p uint16, q *big.Rat, want bool) {
+		t.Helper()
+		b := half.Convert(negative, q)
+		if (b.Pattern() == p) != want {
+			t.Fatalf("Convert(%s) pattern %04X, want membership %v for %04X", q, b.Pattern(), want, p)
+		}
+	}
+
+	for sign := uint16(0); sign <= 1; sign++ {
+		neg := sign == 1
+		for E := uint16(0); E <= 30; E++ {
+			for F := uint16(0); F <= 1023; F++ {
+				positiveP := E<<10 | F
+				p := positiveP | sign<<15
+				magnitude := decodePattern(positiveP)
+				q := signed(neg, magnitude)
+				b := half.Convert(neg, q)
+				if b.Pattern() != p {
+					t.Fatalf("setup: %04X converted to %04X", p, b.Pattern())
+				}
+				cert := half.Certificate(b)
+
+				var wantLower, wantUpper *big.Rat
+				if E == 0 && F == 0 {
+					wantLower = new(big.Rat)
+					wantUpper = ratPow2(1, 25)
+				} else {
+					wantLower = average(decodePattern(positiveP-1), magnitude)
+					if positiveP == 0x7BFF {
+						wantUpper = big.NewRat(65520, 1)
+					} else {
+						wantUpper = average(magnitude, decodePattern(positiveP+1))
+					}
+				}
+				if neg {
+					wantLower, wantUpper = new(big.Rat).Neg(wantUpper), new(big.Rat).Neg(wantLower)
+				}
+				wantInclusive := F&1 == 0
+				if cert.Lower == nil || cert.Lower.Cmp(wantLower) != 0 || cert.LowerInclusive != wantInclusive {
+					t.Fatalf("pattern %04X lower = %v(%v), want %v(%v)",
+						p, cert.Lower, cert.LowerInclusive, wantLower, wantInclusive)
+				}
+				if cert.Upper == nil || cert.Upper.Cmp(wantUpper) != 0 || cert.UpperInclusive != wantInclusive {
+					t.Fatalf("pattern %04X upper = %v(%v), want %v(%v)",
+						p, cert.Upper, cert.UpperInclusive, wantUpper, wantInclusive)
+				}
+
+				if !cert.Contains(neg, q) {
+					t.Fatalf("pattern %04X certificate does not contain its exact value %s", p, q)
+				}
+				wantMembership(t, neg, p, q, true)
+
+				probe := func(value *big.Rat, want bool) {
+					negative := neg
+					if value.Sign() != 0 {
+						negative = value.Sign() < 0
+					}
+					if cert.Contains(negative, value) != want {
+						t.Fatalf("pattern %04X interval contains %s = %v, want %v",
+							p, value, !want, want)
+					}
+					wantMembership(t, negative, p, value, want)
+				}
+				probe(wantLower, wantInclusive)
+				probe(between(q, wantLower), true)
+				if wantLower.Cmp(q) != 0 {
+					probe(shift(wantLower, new(big.Rat).Sub(wantLower, between(q, wantLower))), false)
+				}
+				probe(wantUpper, wantInclusive)
+				probe(between(q, wantUpper), true)
+				if wantUpper.Cmp(q) != 0 {
+					probe(shift(wantUpper, new(big.Rat).Sub(wantUpper, between(q, wantUpper))), false)
+				}
+			}
+		}
+	}
+
+	// Signed zero intervals are disjoint as certificates even though
+	// their numerical values are both zero.
+	for _, neg := range []bool{false, true} {
+		b := half.Convert(neg, new(big.Rat))
+		cert := half.Certificate(b)
+		if !cert.Contains(neg, new(big.Rat)) || cert.Contains(!neg, new(big.Rat)) {
+			t.Fatalf("signed zero (negative=%v) certificate has wrong zero membership", neg)
+		}
+	}
+}
+
+// TestIntervalInfinityAndOverflow checks the one-sided overflow tails.
+func TestIntervalInfinityAndOverflow(t *testing.T) {
+	positive := half.Convert(false, big.NewRat(100000, 1))
+	cert := half.Certificate(positive)
+	if cert.Lower == nil || cert.Lower.Cmp(big.NewRat(65520, 1)) != 0 ||
+		!cert.LowerInclusive || cert.Upper != nil || cert.UpperInclusive {
+		t.Fatalf("positive infinity cert = %+v", cert)
+	}
+	for _, c := range []struct {
+		q    *big.Rat
+		want bool
+	}{
+		{big.NewRat(65519, 1), false},
+		{big.NewRat(65520, 1), true},
+		{big.NewRat(65521, 1), true},
+		{big.NewRat(100000, 1), true},
+	} {
+		if got := cert.Contains(false, c.q); got != c.want {
+			t.Fatalf("positive infinity contains %s = %v, want %v", c.q, got, c.want)
+		}
+	}
+
+	negative := half.Convert(true, big.NewRat(-100000, 1))
+	negCert := half.Certificate(negative)
+	if negCert.Upper == nil || negCert.Upper.Cmp(big.NewRat(-65520, 1)) != 0 ||
+		!negCert.UpperInclusive || negCert.Lower != nil || negCert.LowerInclusive {
+		t.Fatalf("negative infinity cert = %+v", negCert)
+	}
+	for _, c := range []struct {
+		q    *big.Rat
+		want bool
+	}{
+		{big.NewRat(-65519, 1), false},
+		{big.NewRat(-65520, 1), true},
+		{big.NewRat(-65521, 1), true},
+		{big.NewRat(-100000, 1), true},
+	} {
+		if got := negCert.Contains(true, c.q); got != c.want {
+			t.Fatalf("negative infinity contains %s = %v, want %v", c.q, got, c.want)
+		}
+	}
+}
+
 // TestRenderFinite sanity-checks the test's own decimal renderer.
 func TestRenderFinite(t *testing.T) {
 	cases := []struct {

@@ -10,9 +10,10 @@
 // The request is either {"values": ["0.1", "-2e3", ...]} or a bare
 // JSON array of strings. The response lists the four-hex-digit bit
 // pattern, the IEEE class (zero/subnormal/normal/infinity) and the
-// exact reduced rounding fraction (null for infinities). Rejected
-// entries appear with "ok": false and a reason; malformed requests
-// exit non-zero.
+// exact reduced rounding fraction (null for infinities). An object
+// request may set "include_interval_certificate": true to add exact
+// rounding intervals to each legal item. Rejected entries appear with
+// "ok": false and a reason; malformed requests exit non-zero.
 package main
 
 import (
