@@ -214,3 +214,131 @@ func Error(b Bits, original *big.Rat) *big.Rat {
 	}
 	return new(big.Rat).Sub(b.Value, original)
 }
+
+// Interval is the exact certificate of the set of signed real values
+// that round (roundTiesToEven) to the bit pattern carried by the Bits
+// passed to IntervalOf. Every bound is a reduced *big.Rat; no host
+// floating point is used anywhere.
+//
+// A nil Low with LowInfinite set means the -infinity tail; a nil High
+// with HighInfinite set means the +infinity tail. The inclusivity flags
+// record how the exact tie midpoints are resolved (ties to even).
+//
+// The two signed zeros get separate, sign-specific intervals that meet
+// at the rational 0: [0, 2^-25] for +0 and [-2^-25, 0] for -0. Because
+// the rational 0 itself does not remember a sign, membership at 0 is
+// adjudicated from the input sign via Contains, exactly as Parse does.
+type Interval struct {
+	Low           *big.Rat
+	High          *big.Rat
+	LowInclusive  bool
+	HighInclusive bool
+	LowInfinite   bool
+	HighInfinite  bool
+}
+
+// midpoint returns the exact reduced arithmetic mean (a+b)/2.
+func midpoint(a, b *big.Rat) *big.Rat {
+	m := new(big.Rat).Add(a, b)
+	return m.Quo(m, big.NewRat(2, 1))
+}
+
+// IntervalOf returns the exact rounding preimage interval of b: every
+// legal decimal whose parsed value (with its sign) lies in the interval
+// encodes to b.Pattern().
+func IntervalOf(b Bits) Interval {
+	// Overflow tails: the tie 65520 between 65504 and infinity resolves
+	// to the even infinity candidate, so the tail endpoint is included.
+	if b.Class == ClassInfinity {
+		threshold := new(big.Rat).SetInt64(65520)
+		if b.Sign == 0 {
+			return Interval{Low: threshold, LowInclusive: true, HighInfinite: true}
+		}
+		return Interval{LowInfinite: true, High: new(big.Rat).Neg(threshold), HighInclusive: true}
+	}
+
+	// Signed zero preimages. The tie magnitude 2^-25 between zero
+	// (significand 0, even) and the smallest subnormal (significand 1,
+	// odd) rounds to zero, so the outer endpoint is included.
+	if b.Class == ClassZero {
+		tie := p2(-25)
+		zero := new(big.Rat)
+		if b.Sign == 0 {
+			return Interval{Low: zero, LowInclusive: true, High: tie, HighInclusive: true}
+		}
+		return Interval{Low: new(big.Rat).Neg(tie), LowInclusive: true, High: zero, HighInclusive: true}
+	}
+
+	// Finite nonzero result. Locate the adjacent representable
+	// magnitudes purely from the stored fields: neighbors differ by one
+	// fraction step, wrapping F=1023 to the next binade's F=0 (and
+	// vice versa), with E=0 denoting the subnormal grid.
+	v := finiteMagnitude(b.E, b.F)
+	var pred *big.Rat
+	if b.F >= 1 {
+		pred = finiteMagnitude(b.E, b.F-1)
+	} else {
+		// Power of two: predecessor is the previous binade's top value
+		// (E-1 == 0 is the largest subnormal, neighbor of 2^-14).
+		pred = finiteMagnitude(b.E-1, 1023)
+	}
+	low := midpoint(pred, v)
+
+	var high *big.Rat
+	switch {
+	case b.E == 30 && b.F == 1023:
+		// 65504: half an ULP beyond is the overflow tie 65520.
+		high = new(big.Rat).SetInt64(65520)
+	case b.F <= 1022:
+		high = midpoint(v, finiteMagnitude(b.E, b.F+1))
+	default: // F == 1023: next binade power of two
+		high = midpoint(v, finiteMagnitude(b.E+1, 0))
+	}
+
+	// At either midpoint the two candidates are consecutive integer
+	// significands in the common fine grid; the even one wins. The
+	// result's own candidate is even exactly when its stored fraction
+	// field F is even (m = 1024+F has the same parity; subnormal F is
+	// the significand directly).
+	inclusive := b.F&1 == 0
+	if b.Sign == 0 {
+		return Interval{Low: low, High: high, LowInclusive: inclusive, HighInclusive: inclusive}
+	}
+	// Mirror across zero: [-high, -low], swapping endpoint roles.
+	return Interval{
+		Low:           new(big.Rat).Neg(high),
+		High:          new(big.Rat).Neg(low),
+		LowInclusive:  inclusive,
+		HighInclusive: inclusive,
+	}
+}
+
+// Contains is the independent adjudicator: it reports whether a parsed
+// decimal (the sign flag plus its exact rational value) encodes to the
+// bit pattern whose certificate is iv. A zero value matches only the
+// certificate of the input-sign-matching signed zero.
+func (iv Interval) Contains(negativeInput bool, x *big.Rat) bool {
+	if x.Sign() == 0 {
+		if negativeInput {
+			return iv.High != nil && iv.High.Sign() == 0
+		}
+		return iv.Low != nil && iv.Low.Sign() == 0
+	}
+	if !iv.LowInfinite {
+		switch c := x.Cmp(iv.Low); {
+		case c < 0:
+			return false
+		case c == 0 && !iv.LowInclusive:
+			return false
+		}
+	}
+	if !iv.HighInfinite {
+		switch c := x.Cmp(iv.High); {
+		case c > 0:
+			return false
+		case c == 0 && !iv.HighInclusive:
+			return false
+		}
+	}
+	return true
+}

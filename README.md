@@ -75,6 +75,42 @@
 - `rounding_error`：**舍入值 − 原值** 的最简分数（`big.Rat` 天然约分）；
   结果为无穷时是 `null`；被拒绝的元素不含该字段。
 
+## 可选：精确区间证书
+
+复核边界值时，只看单点误差不够：请求里加 `"with_intervals": true`
+（或命令行加 `-with-intervals`），每个合法结果会额外给出**恰好会编码成
+该位型的全部实数输入**的区间，边界全程是 `big.Rat` 最简分数，**不使用
+宿主浮点或近似小数**；未启用时输出与原来逐字段一致。
+
+```json
+{
+  "hex": "2E66",
+  "class": "normal",
+  "rounding_error": "-1/40960",
+  "interval": {
+    "low": "3275/32768",
+    "high": "3277/32768",
+    "low_inclusive": true,
+    "high_inclusive": true
+  }
+}
+```
+
+- 边界是与**相邻位型**的精确中点 `(v₋+v)/2`；端点归属按
+  roundTiesToEven：结果尾数字段 F 为偶时两端点都含，F 为奇时两端点
+  都不含（`big.Rat` 自动约分，例如次正规/正规交界写作 `2047/33554432`）；
+- 区间跨 binade 时两侧 ULP 不同，中点严格按各自相邻值分别取，因此
+  2 的幂（F=0）两侧边界天然不对称；
+- 正负零按输入符号分开：`+0` 为 `[0, 2⁻²⁵]`，`-0` 为 `[-2⁻²⁵, 0]`，
+  零值点凭输入符号裁决（`-0` 进负零证书，`0`/`+0` 进正零证书）；
+- 最大有限值 65504 的区间上界为 65520（不含，F=1023 为奇）；溢出结果
+  明确表示尾区间：正无穷 `[65520/1, null)`（中点 65520 归偶候选无穷），
+  负无穷 `(null, -65520/1]`，`null` 端表示无穷外侧；
+- 证书可脱离本程序独立裁决：把另一个合法十进制解析为有理数，按端点及
+  `*_inclusive` 比较即可判定它是否编码成同一 `hex`，结论与 `hex`、
+  `class`、`rounding_error` 完全一致；
+- 单项非法输入依旧各自失败、不带 `interval`，不影响同批其余结果。
+
 ## 舍入规则
 
 IEEE binary16，**roundTiesToEven**（最近值，正好居中取偶数）：
@@ -97,6 +133,7 @@ go test ./...
 go build ./cmd/halfconv
 ./halfconv data/batch.json
 cat data/batch.json | ./halfconv
+./halfconv -with-intervals data/batch.json   # 附带精确区间证书
 ```
 
 Docker Compose（`half` 服务负责批量运行；镜像构建阶段会跑完整测试，
@@ -113,7 +150,7 @@ cat batch.json | docker compose run --rm -T half -
 | 路径 | 作用 |
 | --- | --- |
 | `internal/decimal` | 十进制字符串 → 精确 `big.Rat`（含 30 位/指数/格式校验） |
-| `internal/half` | binary16 纯整数/有理数舍入与位型重建 |
+| `internal/half` | binary16 纯整数/有理数舍入、位型重建与精确区间证书 |
 | `internal/app` | JSON 批处理装配与命令行入口逻辑 |
 | `cmd/halfconv` | 命令行 |
 | `data/batch.json` | 示例批次（含边界值与非法值） |
@@ -130,4 +167,10 @@ cat batch.json | docker compose run --rm -T half -
 - 解析器对 NaN/Infinity/非法格式/超位数/超指数的拒绝；
 - 另含一个**完全独立的暴力 oracle**：枚举所有 binary16 候选直接比较
   有理数距离做 tie-to-even，与生产实现在数千个二进制网格点（含大量
-  精确居中点）和随机十进制串上对拍。
+  精确居中点）和随机十进制串上对拍；
+- 区间证书以**相邻位型的精确中点为独立预言机**：穷举全部有限位型核对
+  每个端点的有理数与包含性、中点两侧各 1/8-ULP 探针、正负零分开、
+  次正规/正规交界、65504 与溢出尾区间；再用数千个随机合法十进制验证
+  证书构成精确划分（值只被自己的区间接受、相邻位型区间一律拒绝），
+  并从 JSON 证书反解有理数独立裁决另一十进制是否编码成同一位型，
+  覆盖混合批次中夹带非法值的情形。
